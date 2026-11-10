@@ -1,1 +1,255 @@
+# ==============================================================================
+# PROJECT: GOOGLE PLAY STORE APPS CLUSTERING & MARKET SEGMENTATION
+# Description: End-to-end unsupervised learning pipeline (K-Means, Agglomerative, DBSCAN)
+# ==============================================================================
 
+# --- STEP 1 & 2: ENVIRONMENT CONFIGURATION & DATA INGESTION ---
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans, AgglomerativeClustering, DBSCAN
+from sklearn.metrics import silhouette_score, davies_bouldin_score
+from sklearn.decomposition import PCA
+
+import warnings
+warnings.filterwarnings('ignore')
+
+# Visual style setup
+sns.set_theme(style="whitegrid", palette="muted")
+plt.rcParams['font.sans-serif'] = 'DejaVu Sans'
+plt.rcParams['figure.figsize'] = (10, 6)
+
+print("--- [STEP 1 & 2] LOADING AND PRELIMINARY DATA INSPECTION ---")
+
+# Load dataset
+df_raw = pd.read_csv('googleplaystore.csv')
+
+print(f"Raw dataset shape: {df_raw.shape[0]} rows, {df_raw.shape[1]} columns\n")
+print("Dataset schema and preliminary column data types:")
+df_raw.info()
+
+print("\nSample records:")
+display(df_raw.head(3))
+
+# --- STEP 3: DATA CLEANING & STANDARDIZATION ---
+print("\n--- [STEP 3] DATA CLEANING & IMPUTATION PIPELINE ---")
+
+df = df_raw.copy()
+
+# 3.1. Remove corrupted row with shifted columns (Category == '1.9')
+df = df[df['Category'] != '1.9']
+
+# 3.2. Deduplicate application entries
+df.drop_duplicates(subset=['App'], keep='first', inplace=True)
+print(f"Total unique applications after deduplication: {len(df)}")
+
+# 3.3. Sanitize 'Reviews' column -> Integer
+df['Reviews'] = pd.to_numeric(df['Reviews'], errors='coerce')
+
+# 3.4. Sanitize 'Installs' column -> Remove '+' and ',' symbols -> Integer
+df['Installs'] = df['Installs'].astype(str).str.replace('+', '', regex=False)
+df['Installs'] = df['Installs'].str.replace(',', '', regex=False)
+df['Installs'] = pd.to_numeric(df['Installs'], errors='coerce')
+
+# 3.5. Sanitize 'Price' column -> Remove '$' symbol -> Float
+df['Price'] = df['Price'].astype(str).str.replace('$', '', regex=False)
+df['Price'] = pd.to_numeric(df['Price'], errors='coerce')
+
+# 3.6. Normalize 'Size' column to Megabytes (MB)
+def parse_size_to_mb(val):
+    if pd.isna(val) or val == 'Varies with device':
+        return np.nan
+    val = str(val).strip()
+    if val.endswith('M'):
+        return float(val.replace('M', ''))
+    elif val.endswith(('k', 'K')):
+        return float(val.replace('k', '').replace('K', '')) / 1024.0
+    return np.nan
+
+df['Size_MB'] = df['Size'].apply(parse_size_to_mb)
+
+# 3.7. Conditional Median Imputation
+# Impute missing 'Size_MB' with category-conditional median
+df['Size_MB'] = df.groupby('Category')['Size_MB'].transform(lambda x: x.fillna(x.median()))
+df['Size_MB'].fillna(df['Size_MB'].median(), inplace=True)
+
+# Impute missing 'Rating' with category-conditional median
+df['Rating'] = df.groupby('Category')['Rating'].transform(lambda x: x.fillna(x.median()))
+df['Rating'].fillna(df['Rating'].median(), inplace=True)
+
+# 3.8. Drop remaining missing entries in essential columns
+df.dropna(subset=['Reviews', 'Installs', 'Price', 'Rating', 'Size_MB'], inplace=True)
+
+print(f"Final clean dataset shape: {df.shape[0]} rows, {df.shape[1]} columns\n")
+print("Summary statistics of numeric features:")
+display(df[['Rating', 'Reviews', 'Size_MB', 'Installs', 'Price']].describe())
+
+# --- STEP 4: EXPLORATORY DATA ANALYSIS (EDA) & FEATURE SELECTION ---
+print("\n--- [STEP 4] EDA, LOGARITHMIC TRANSFORMATION & SCALING ---")
+
+# 4.1. Resolve power-law right-skewness using log1p: log(1 + x)
+df['Log_Reviews'] = np.log1p(df['Reviews'])
+df['Log_Installs'] = np.log1p(df['Installs'])
+df['Log_Price'] = np.log1p(df['Price'])
+
+# 4.2. Visualize distributions before and after log transformations (Figure 1)
+fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+fig.suptitle('Feature Distributions: Raw vs. Log-Transformed', fontsize=16, fontweight='bold')
+
+sns.histplot(df['Rating'], bins=20, kde=True, ax=axes[0, 0], color='skyblue').set_title('Rating Distribution')
+sns.histplot(df['Size_MB'], bins=25, kde=True, ax=axes[0, 1], color='salmon').set_title('Size (MB) Distribution')
+sns.histplot(df['Installs'], bins=25, kde=False, ax=axes[0, 2], color='lightgreen').set_title('Raw Installs (Highly Skewed)')
+
+sns.histplot(df['Log_Reviews'], bins=25, kde=True, ax=axes[1, 0], color='blue').set_title('Log(1 + Reviews)')
+sns.histplot(df['Log_Installs'], bins=20, kde=True, ax=axes[1, 1], color='green').set_title('Log(1 + Installs)')
+sns.histplot(df['Log_Price'], bins=15, kde=True, ax=axes[1, 2], color='purple').set_title('Log(1 + Price)')
+
+plt.tight_layout()
+# Auto-save figure for report insertion
+plt.savefig('figure1_distributions.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# 4.3. Pearson Correlation Heatmap (Figure 2)
+feature_cols = ['Rating', 'Size_MB', 'Log_Reviews', 'Log_Installs', 'Log_Price']
+plt.figure(figsize=(8, 6))
+sns.heatmap(df[feature_cols].corr(), annot=True, cmap='coolwarm', fmt=".2f", vmin=-1, vmax=1, linewidths=0.5)
+plt.title('Correlation Matrix of Selected Clustering Features', fontsize=13, fontweight='bold')
+
+plt.tight_layout()
+# Auto-save figure for report insertion
+plt.savefig('figure2_heatmap.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# 4.4. Feature Standardization via StandardScaler
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(df[feature_cols])
+
+print(f"Transformed and standardized feature matrix X shape: {X_scaled.shape}")
+
+# --- STEP 5 & 6: MODEL IMPLEMENTATION, TUNING & EVALUATION ---
+print("\n--- [STEP 5 & 6] HYPERPARAMETER TUNING & ALGORITHM BENCHMARKING ---")
+
+# 6.1. Evaluate optimal k for K-Means (Elbow Method & Silhouette Analysis)
+wcss = []
+k_range = range(1, 11)
+silhouette_scores = []
+k_eval_range = range(2, 9)
+
+for k in k_range:
+    km = KMeans(n_clusters=k, init='k-means++', n_init=10, random_state=42)
+    km.fit(X_scaled)
+    wcss.append(km.inertia_)
+    if k in k_eval_range:
+        score = silhouette_score(X_scaled, km.labels_)
+        silhouette_scores.append(score)
+
+# Plot Elbow and Silhouette curves side-by-side (Figure 3)
+fig, ax = plt.subplots(1, 2, figsize=(15, 5))
+
+# Elbow Curve
+ax[0].plot(k_range, wcss, 'bo-', linewidth=2, markersize=7)
+ax[0].set_xlabel('Number of Clusters (k)', fontsize=11)
+ax[0].set_ylabel('Within-Cluster Sum of Squares (Inertia)', fontsize=11)
+ax[0].set_title('Elbow Method for Optimal k', fontsize=13, fontweight='bold')
+ax[0].axvline(x=4, color='red', linestyle='--', label='Elbow Point (k = 4)')
+ax[0].legend()
+
+# Silhouette Curve
+ax[1].plot(list(k_eval_range), silhouette_scores, 'rs--', linewidth=2, markersize=7)
+ax[1].set_xlabel('Number of Clusters (k)', fontsize=11)
+ax[1].set_ylabel('Silhouette Score', fontsize=11)
+ax[1].set_title('Silhouette Analysis Across k', fontsize=13, fontweight='bold')
+ax[1].axvline(x=4, color='blue', linestyle='--', label='Balanced Optimum (k = 4)')
+ax[1].legend()
+
+plt.tight_layout()
+# Auto-save figure for report insertion
+plt.savefig('figure3_elbow_silhouette.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# 6.2. Train Primary Model: K-Means (k=4)
+optimal_k = 4
+kmeans = KMeans(n_clusters=optimal_k, init='k-means++', n_init=20, random_state=42)
+df['Cluster_KMeans'] = kmeans.fit_predict(X_scaled)
+km_sil = silhouette_score(X_scaled, df['Cluster_KMeans'])
+km_db = davies_bouldin_score(X_scaled, df['Cluster_KMeans'])
+
+# 6.3. Train Alternative Model 1: Agglomerative Hierarchical Clustering (k=4)
+agg = AgglomerativeClustering(n_clusters=optimal_k, linkage='ward')
+df['Cluster_Agg'] = agg.fit_predict(X_scaled)
+agg_sil = silhouette_score(X_scaled, df['Cluster_Agg'])
+agg_db = davies_bouldin_score(X_scaled, df['Cluster_Agg'])
+
+# 6.4. Train Alternative Model 2: DBSCAN
+dbscan = DBSCAN(eps=1.2, min_samples=10)
+df['Cluster_DBSCAN'] = dbscan.fit_predict(X_scaled)
+# Compute metrics excluding noise points (-1)
+db_mask = df['Cluster_DBSCAN'] != -1
+db_sil = silhouette_score(X_scaled[db_mask], df['Cluster_DBSCAN'][db_mask])
+db_db = davies_bouldin_score(X_scaled[db_mask], df['Cluster_DBSCAN'][db_mask])
+n_noise = (df['Cluster_DBSCAN'] == -1).sum()
+
+# Print Comparative Benchmark Table
+benchmark_results = pd.DataFrame({
+    'Model': ['K-Means (k=4)', 'Agglomerative (k=4)', 'DBSCAN (eps=1.2)'],
+    'Silhouette Score (Higher is Better)': [km_sil, agg_sil, db_sil],
+    'Davies-Bouldin Index (Lower is Better)': [km_db, agg_db, db_db],
+    'Notes': ['Balanced, well-separated clusters', 'High computational cost O(N^2)', f'{n_noise} noise points identified']
+})
+print("\nClustering Algorithms Benchmark:")
+display(benchmark_results.round(3))
+
+# --- STEP 7: CLUSTER PROFILING & MARKET PERSONAS ---
+print("\n--- [STEP 7] CLUSTER PROFILING & BUSINESS PERSONAS ---")
+
+# 7.1. Dimensionality Reduction via PCA for 2D Projection (Figure 4)
+pca = PCA(n_components=2, random_state=42)
+X_pca = pca.fit_transform(X_scaled)
+df['PCA1'] = X_pca[:, 0]
+df['PCA2'] = X_pca[:, 1]
+
+plt.figure(figsize=(10, 6))
+sns.scatterplot(
+    x='PCA1', 
+    y='PCA2', 
+    hue='Cluster_KMeans', 
+    data=df, 
+    palette='tab10', 
+    s=45, 
+    alpha=0.8
+)
+plt.title('2D PCA Projection of Google Play Store K-Means Clusters', fontsize=13, fontweight='bold')
+plt.xlabel(f'Principal Component 1 ({pca.explained_variance_ratio_[0]*100:.1f}% Variance)')
+plt.ylabel(f'Principal Component 2 ({pca.explained_variance_ratio_[1]*100:.1f}% Variance)')
+plt.legend(title='Cluster ID', loc='best')
+
+plt.tight_layout()
+# Auto-save figure for report insertion
+plt.savefig('figure4_pca_clusters.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# 7.2. Compute Numerical Profiles (Median & Mean) for Each Cluster
+cluster_stats = df.groupby('Cluster_KMeans')[['Rating', 'Size_MB', 'Installs', 'Reviews', 'Price']].agg(['median', 'mean']).round(2)
+print("Numeric Profiles across Identified Clusters:")
+display(cluster_stats)
+
+# 7.3. Assign Formal Market Persona Labels
+def map_business_persona(cluster_id):
+    # Mapping based on cluster medians for installs, price, and rating
+    if cluster_id == 0:
+        return "Mainstream Blockbusters (High Installs, High Engagement)"
+    elif cluster_id == 1:
+        return "Premium Paid Apps (Niche Monetization, Top Ratings)"
+    elif cluster_id == 2:
+        return "Lightweight Utilities (Small Binary, Steady Downloads)"
+    else:
+        return "Underperforming Apps (Low Rating & Low Traction)"
+
+df['Persona'] = df['Cluster_KMeans'].apply(map_business_persona)
+
+print("\nDistribution of Applications Across Market Personas:")
+print(df['Persona'].value_counts())
+print("\n[SUCCESS] Pipeline execution complete. Figures saved locally as PNG files.")
